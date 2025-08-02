@@ -52,14 +52,15 @@ Thread Execution:
 
 ## Test Results
 - ✅ All coexistence tests pass (3/3)
-- ✅ All core hook tests pass (9/10 - 1 ignored due to pre-existing issue)
+- ✅ All core hook tests pass (10/10 including previously failing test_hook_yield)
 - ✅ No regressions in existing functionality
 - ✅ Thread safety maintained
+- ✅ Stack corruption issue resolved
 
-## Pre-existing Issue Documented
-- `test_hook_yield` has stack corruption when yielding from line hooks
-- Issue is unrelated to coexistence implementation  
-- Test marked as `#[ignore]` with TODO comment for future investigation
+## Stack Corruption Fix
+- **Root Cause**: The `get_thread_hook_info` function was manipulating the stack of actively executing threads, corrupting local variables
+- **Solution**: Implemented dual-key storage system using thread pointer as light userdata key to avoid stack manipulation during execution
+- **Result**: All hook functionality now works safely, including yielding from line hooks
 
 ## Use Case Example
 

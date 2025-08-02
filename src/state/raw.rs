@@ -506,9 +506,6 @@ impl RawLua {
                 ffi::lua_setmetatable(state, -2); // metatable(hooktable) = hooktable
             }
 
-            ffi::lua_pushthread(thread_state);
-            ffi::lua_xmove(thread_state, state, 1); // key (thread)
-            
             // Create a table to store both triggers and callback: {triggers_table, callback}
             ffi::lua_createtable(state, 2, 0);
             
@@ -536,8 +533,19 @@ impl RawLua {
             let _ = push_internal_userdata(state, callback, false);
             ffi::lua_rawseti(state, -2, 2);
             
-            // Store the table in the hooks registry
-            ffi::lua_rawset(state, -3); // hooktable[thread] = {triggers_table, hook_callback}
+            // Store using thread pointer as key (for safe lookup during execution)
+            ffi::lua_pushlightuserdata(state, thread_state as *mut c_void);
+            ffi::lua_pushvalue(state, -2); // Duplicate the hook info table
+            ffi::lua_rawset(state, -4); // hooktable[thread_pointer] = {triggers_table, hook_callback}
+            
+            // Also store using thread object as key (for backward compatibility and normal hook_proc)
+            ffi::lua_pushthread(thread_state);
+            ffi::lua_xmove(thread_state, state, 1); // key (thread)
+            ffi::lua_pushvalue(state, -2); // Duplicate the hook info table
+            ffi::lua_rawset(state, -4); // hooktable[thread] = {triggers_table, hook_callback}
+            
+            // Clean up the duplicated table
+            ffi::lua_pop(state, 1);
         })?;
 
         ffi::lua_sethook(thread_state, Some(hook_proc), triggers.mask(), triggers.count());
@@ -552,25 +560,52 @@ impl RawLua {
         const HOOKS_KEY: *const c_char = cstr!("__mlua_hooks");
         
         let state = self.state();
-        let top = ffi::lua_gettop(state);
         
-        // Get the hooks table from registry
+        // CRITICAL: We must NEVER modify the thread_state stack as it may be actively executing
+        // and have local variables that would be corrupted. Instead, we use the thread state pointer
+        // as a unique identifier by converting it to a light userdata key.
+        let original_top = ffi::lua_gettop(state);
+        
+        // Get the hooks table from registry on the main state
         if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) != ffi::LUA_TTABLE {
-            ffi::lua_settop(state, top);
+            ffi::lua_settop(state, original_top);
             return None;
         }
         
-        // Get the hook info for this thread
-        ffi::lua_pushthread(thread_state);
-        ffi::lua_xmove(thread_state, state, 1);
-        if ffi::lua_rawget(state, -2) != ffi::LUA_TTABLE {
-            ffi::lua_settop(state, top);
-            return None;
+        // Use the thread_state pointer as a light userdata key to avoid stack manipulation
+        // This is safe because the thread state pointer is unique and stable
+        ffi::lua_pushlightuserdata(state, thread_state as *mut c_void);
+        
+        // First try to get hook info using the pointer as key (new storage method)
+        if ffi::lua_rawget(state, -2) == ffi::LUA_TTABLE {
+            // Found using pointer key - process normally
+        } else {
+            // Not found with pointer key, try the old thread object key method
+            // But only if we can do it safely (for non-executing threads)
+            ffi::lua_pop(state, 1); // Pop the nil result
+            
+            if thread_state == state {
+                // For main thread, get the main thread reference from registry
+                if ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_MAINTHREAD) != ffi::LUA_TTHREAD {
+                    ffi::lua_settop(state, original_top);
+                    return None;
+                }
+            } else {
+                // For other threads, this is risky during execution - skip for now
+                // In the future, we should migrate all thread hooks to use pointer keys
+                ffi::lua_settop(state, original_top);
+                return None;
+            }
+            
+            if ffi::lua_rawget(state, -2) != ffi::LUA_TTABLE {
+                ffi::lua_settop(state, original_top);
+                return None;
+            }
         }
         
         // Extract triggers table (first element)
         if ffi::lua_rawgeti(state, -1, 1) != ffi::LUA_TTABLE {
-            ffi::lua_settop(state, top);
+            ffi::lua_settop(state, original_top);
             return None;
         }
         
@@ -620,19 +655,19 @@ impl RawLua {
         
         // Extract callback (second element)
         if ffi::lua_rawgeti(state, -1, 2) != ffi::LUA_TUSERDATA {
-            ffi::lua_settop(state, top);
+            ffi::lua_settop(state, original_top);
             return None;
         }
         
         let callback = match get_internal_userdata::<HookCallback>(state, -1, ptr::null()) {
             ptr if !ptr.is_null() => unsafe { (*ptr).clone() },
             _ => {
-                ffi::lua_settop(state, top);
+                ffi::lua_settop(state, original_top);
                 return None;
             }
         };
         
-        ffi::lua_settop(state, top); // Restore original stack
+        ffi::lua_settop(state, original_top); // Restore original stack
         
         let triggers = HookTriggers {
             on_calls,

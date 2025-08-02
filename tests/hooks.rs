@@ -258,7 +258,6 @@ fn test_hook_threads() -> Result<()> {
 }
 
 #[test]
-#[ignore] // TODO: This test has a stack corruption issue with line hooks yielding
 fn test_hook_yield() -> Result<()> {
     let lua = Lua::new();
 
