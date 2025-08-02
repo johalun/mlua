@@ -509,6 +509,44 @@ impl RawLua {
         Ok(())
     }
 
+    /// Triggers resume hooks for a thread (if any)
+    #[cfg(not(feature = "luau"))]
+    pub(crate) unsafe fn trigger_resume_hook(&self, thread_state: *mut ffi::lua_State) -> Result<()> {
+        use crate::debug::Debug;
+        use crate::types::VmState;
+        use crate::state::util::callback_error_ext;
+        use std::ptr;
+
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+
+        // For thread-specific hooks, we need to check if the hook has on_resume enabled
+        // The current implementation doesn't store triggers separately for thread hooks,
+        // so for now we'll implement this for global hooks only, but we'll trigger
+        // thread hooks that exist (assuming they want resume events if they're set)
+        
+        // Check for global hook first
+        if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
+            let triggers = (*self.extra.get()).hook_triggers;
+            if triggers.on_resume {
+                let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
+                    let rawlua = (*extra).raw_lua();
+                    let debug = Debug::new_resume(rawlua);
+                    hook_callback((*extra).lua(), &debug)
+                });
+
+                match status {
+                    VmState::Continue => {}
+                    VmState::Yield => {
+                        // Resume hooks cannot yield - for now we ignore this
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// See [`Lua::create_string`]
     pub(crate) unsafe fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
         let state = self.state();

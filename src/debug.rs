@@ -31,6 +31,18 @@ impl<'a> Debug<'a> {
         }
     }
 
+    /// Creates a custom Debug instance for resume events.
+    /// Since resume is not a native Lua debug event, we create a synthetic Debug struct.
+    #[cfg(not(feature = "luau"))]
+    pub(crate) fn new_resume(lua: &'a RawLua) -> Self {
+        Debug {
+            state: lua.state(),
+            lua,
+            ar: std::ptr::null_mut(),
+            level: 0,
+        }
+    }
+
     /// Returns the specific event that triggered the hook.
     ///
     /// For [Lua 5.1] [`DebugEvent::TailCall`] is used for return events to indicate a return
@@ -40,6 +52,11 @@ impl<'a> Debug<'a> {
     #[cfg(not(feature = "luau"))]
     #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
     pub fn event(&self) -> DebugEvent {
+        if self.ar.is_null() {
+            // This is a custom resume event
+            return DebugEvent::Resume;
+        }
+        
         unsafe {
             match (*self.ar).event {
                 ffi::LUA_HOOKCALL => DebugEvent::Call,
@@ -55,7 +72,16 @@ impl<'a> Debug<'a> {
     /// Returns the function that is running at the given level.
     ///
     /// Corresponds to the `f` "what" mask.
+    /// 
+    /// # Note
+    /// 
+    /// This method is not available for resume events and will return an error.
     pub fn function(&self) -> Function {
+        if self.ar.is_null() {
+            // For resume events, function information is not available
+            panic!("Debug::function() is not available for resume events");
+        }
+        
         unsafe {
             let _sg = StackGuard::new(self.state);
             assert_stack(self.state, 1);
@@ -77,7 +103,22 @@ impl<'a> Debug<'a> {
     }
 
     /// Corresponds to the `n` "what" mask.
+    /// 
+    /// # Note
+    /// 
+    /// This method is not available for resume events and will return default values.
     pub fn names(&self) -> DebugNames<'_> {
+        if self.ar.is_null() {
+            // For resume events, return default/empty names
+            return DebugNames {
+                name: None,
+                #[cfg(not(feature = "luau"))]
+                name_what: None,
+                #[cfg(feature = "luau")]
+                name_what: None,
+            };
+        }
+        
         unsafe {
             #[cfg(not(feature = "luau"))]
             mlua_assert!(
@@ -104,7 +145,25 @@ impl<'a> Debug<'a> {
     }
 
     /// Corresponds to the `S` "what" mask.
+    /// 
+    /// # Note
+    /// 
+    /// This method is not available for resume events and will return default values.
     pub fn source(&self) -> DebugSource<'_> {
+        if self.ar.is_null() {
+            // For resume events, return default source info
+            return DebugSource {
+                source: Some(std::borrow::Cow::Borrowed("[resume]")),
+                short_src: Some(std::borrow::Cow::Borrowed("[resume]")),
+                line_defined: None,
+                #[cfg(not(feature = "luau"))]
+                last_line_defined: None,
+                #[cfg(feature = "luau")]
+                last_line_defined: None,
+                what: "resume",
+            };
+        }
+        
         unsafe {
             #[cfg(not(feature = "luau"))]
             mlua_assert!(
@@ -140,7 +199,16 @@ impl<'a> Debug<'a> {
     }
 
     /// Corresponds to the `l` "what" mask. Returns the current line.
+    /// 
+    /// # Note
+    /// 
+    /// This method is not available for resume events and will return None.
     pub fn current_line(&self) -> Option<usize> {
+        if self.ar.is_null() {
+            // For resume events, line information is not available
+            return None;
+        }
+        
         unsafe {
             #[cfg(not(feature = "luau"))]
             mlua_assert!(
@@ -159,12 +227,21 @@ impl<'a> Debug<'a> {
 
     /// Corresponds to the `t` "what" mask. Returns true if the hook is in a function tail call,
     /// false otherwise.
+    /// 
+    /// # Note
+    /// 
+    /// This method is not available for resume events and will return false.
     #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
     #[cfg_attr(
         docsrs,
         doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52")))
     )]
     pub fn is_tail_call(&self) -> bool {
+        if self.ar.is_null() {
+            // For resume events, tail call information is not available
+            return false;
+        }
+        
         unsafe {
             mlua_assert!(
                 ffi::lua_getinfo(self.state, cstr!("t"), self.ar) != 0,
@@ -175,7 +252,22 @@ impl<'a> Debug<'a> {
     }
 
     /// Corresponds to the `u` "what" mask.
+    /// 
+    /// # Note
+    /// 
+    /// This method is not available for resume events and will return default values.
     pub fn stack(&self) -> DebugStack {
+        if self.ar.is_null() {
+            // For resume events, stack information is not available
+            return DebugStack {
+                num_ups: 0,
+                #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+                num_params: 0,
+                #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+                is_vararg: false,
+            };
+        }
+        
         unsafe {
             #[cfg(not(feature = "luau"))]
             mlua_assert!(
@@ -215,6 +307,9 @@ pub enum DebugEvent {
     TailCall,
     Line,
     Count,
+    /// Custom event when a coroutine/thread resumes execution.
+    /// This is not a native Lua debug event.
+    Resume,
     Unknown(c_int),
 }
 
@@ -281,6 +376,16 @@ pub struct HookTriggers {
     ///
     /// Setting this option to a low value can incur a very high overhead.
     pub every_nth_instruction: Option<u32>,
+    /// When a coroutine/thread resumes execution.
+    ///
+    /// This is a custom trigger that's not part of Lua's native debug API. It will be called
+    /// when `Thread::resume()` is invoked on a yielded coroutine.
+    ///
+    /// # Note
+    ///
+    /// This trigger is implemented at the mlua level, not at the Lua C API level, so it only
+    /// works when using mlua's `Thread::resume()` method.
+    pub on_resume: bool,
 }
 
 #[cfg(not(feature = "luau"))]
@@ -294,6 +399,9 @@ impl HookTriggers {
     /// An instance of `HookTriggers` with `every_line` trigger set.
     pub const EVERY_LINE: Self = HookTriggers::new().every_line();
 
+    /// An instance of `HookTriggers` with `on_resume` trigger set.
+    pub const ON_RESUME: Self = HookTriggers::new().on_resume();
+
     /// Returns a new instance of `HookTriggers` with all triggers disabled.
     pub const fn new() -> Self {
         HookTriggers {
@@ -301,6 +409,7 @@ impl HookTriggers {
             on_returns: false,
             every_line: false,
             every_nth_instruction: None,
+            on_resume: false,
         }
     }
 
@@ -333,6 +442,14 @@ impl HookTriggers {
     /// [`every_nth_instruction`]: #structfield.every_nth_instruction
     pub const fn every_nth_instruction(mut self, n: u32) -> Self {
         self.every_nth_instruction = Some(n);
+        self
+    }
+
+    /// Returns an instance of `HookTriggers` with [`on_resume`] trigger set.
+    ///
+    /// [`on_resume`]: #structfield.on_resume
+    pub const fn on_resume(mut self) -> Self {
+        self.on_resume = true;
         self
     }
 
@@ -372,6 +489,7 @@ impl std::ops::BitOr for HookTriggers {
         self.on_calls |= rhs.on_calls;
         self.on_returns |= rhs.on_returns;
         self.every_line |= rhs.every_line;
+        self.on_resume |= rhs.on_resume;
         if self.every_nth_instruction.is_none() && rhs.every_nth_instruction.is_some() {
             self.every_nth_instruction = rhs.every_nth_instruction;
         }

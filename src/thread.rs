@@ -158,6 +158,10 @@ impl Thread {
             let _sg = StackGuard::new(state);
             let _thread_sg = StackGuard::with_top(thread_state, 0);
 
+            // Trigger resume hooks before actually resuming
+            #[cfg(not(feature = "luau"))]
+            lua.trigger_resume_hook(thread_state)?;
+
             let nargs = args.push_into_stack_multi(&lua)?;
             if nargs > 0 {
                 check_stack(thread_state, nargs)?;
