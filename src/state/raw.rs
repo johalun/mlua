@@ -547,6 +547,39 @@ impl RawLua {
         Ok(())
     }
 
+    /// Triggers yield hooks for a thread (if any)
+    #[cfg(not(feature = "luau"))]
+    pub(crate) unsafe fn trigger_yield_hook(&self, thread_state: *mut ffi::lua_State) -> Result<()> {
+        use crate::debug::Debug;
+        use crate::types::VmState;
+        use crate::state::util::callback_error_ext;
+        use std::ptr;
+
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+
+        // Check for global hook first
+        if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
+            let triggers = (*self.extra.get()).hook_triggers;
+            if triggers.on_yield {
+                let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
+                    let rawlua = (*extra).raw_lua();
+                    let debug = Debug::new_yield(rawlua);
+                    hook_callback((*extra).lua(), &debug)
+                });
+
+                match status {
+                    VmState::Continue => {}
+                    VmState::Yield => {
+                        // Yield hooks cannot yield - for now we ignore this
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// See [`Lua::create_string`]
     pub(crate) unsafe fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
         let state = self.state();

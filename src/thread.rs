@@ -223,7 +223,13 @@ impl Thread {
         let ret = ffi::lua_resumex(thread_state, state, nargs, &mut nresults as *mut c_int);
         match ret {
             ffi::LUA_OK => Ok((ThreadStatusInner::Finished, nresults)),
-            ffi::LUA_YIELD => Ok((ThreadStatusInner::Yielded(0), nresults)),
+            ffi::LUA_YIELD => {
+                // Trigger yield hooks when the thread yields
+                #[cfg(not(feature = "luau"))]
+                lua.trigger_yield_hook(thread_state)?;
+                
+                Ok((ThreadStatusInner::Yielded(0), nresults))
+            }
             ffi::LUA_ERRMEM => {
                 // Don't call error handler for memory errors
                 Err(pop_error(thread_state, ret))

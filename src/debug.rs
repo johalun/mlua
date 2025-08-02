@@ -43,6 +43,18 @@ impl<'a> Debug<'a> {
         }
     }
 
+    /// Creates a custom Debug instance for yield events.
+    /// Since yield is not a native Lua debug event, we create a synthetic Debug struct.
+    #[cfg(not(feature = "luau"))]
+    pub(crate) fn new_yield(lua: &'a RawLua) -> Self {
+        Debug {
+            state: lua.state(),
+            lua,
+            ar: std::ptr::null_mut(),
+            level: -1, // Use -1 to distinguish from resume events
+        }
+    }
+
     /// Returns the specific event that triggered the hook.
     ///
     /// For [Lua 5.1] [`DebugEvent::TailCall`] is used for return events to indicate a return
@@ -53,8 +65,12 @@ impl<'a> Debug<'a> {
     #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
     pub fn event(&self) -> DebugEvent {
         if self.ar.is_null() {
-            // This is a custom resume event
-            return DebugEvent::Resume;
+            // This is a custom event
+            if self.level == -1 {
+                return DebugEvent::Yield;
+            } else {
+                return DebugEvent::Resume;
+            }
         }
         
         unsafe {
@@ -151,16 +167,19 @@ impl<'a> Debug<'a> {
     /// This method is not available for resume events and will return default values.
     pub fn source(&self) -> DebugSource<'_> {
         if self.ar.is_null() {
-            // For resume events, return default source info
+            // For custom events, return appropriate source info
+            let what = if self.level == -1 { "yield" } else { "resume" };
+            let source_name = if self.level == -1 { "[yield]" } else { "[resume]" };
+            
             return DebugSource {
-                source: Some(std::borrow::Cow::Borrowed("[resume]")),
-                short_src: Some(std::borrow::Cow::Borrowed("[resume]")),
+                source: Some(std::borrow::Cow::Borrowed(source_name)),
+                short_src: Some(std::borrow::Cow::Borrowed(source_name)),
                 line_defined: None,
                 #[cfg(not(feature = "luau"))]
                 last_line_defined: None,
                 #[cfg(feature = "luau")]
                 last_line_defined: None,
-                what: "resume",
+                what,
             };
         }
         
@@ -310,6 +329,9 @@ pub enum DebugEvent {
     /// Custom event when a coroutine/thread resumes execution.
     /// This is not a native Lua debug event.
     Resume,
+    /// Custom event when a coroutine/thread yields execution.
+    /// This is not a native Lua debug event.
+    Yield,
     Unknown(c_int),
 }
 
@@ -386,6 +408,16 @@ pub struct HookTriggers {
     /// This trigger is implemented at the mlua level, not at the Lua C API level, so it only
     /// works when using mlua's `Thread::resume()` method.
     pub on_resume: bool,
+    /// When a coroutine/thread yields execution.
+    ///
+    /// This is a custom trigger that's not part of Lua's native debug API. It will be called
+    /// when Lua code calls `coroutine.yield()` or when Rust yields from an async host function.
+    ///
+    /// # Note
+    ///
+    /// This trigger is implemented at the mlua level and will be called for both Lua-side
+    /// yields and Rust-side yields from async functions.
+    pub on_yield: bool,
 }
 
 #[cfg(not(feature = "luau"))]
@@ -402,6 +434,9 @@ impl HookTriggers {
     /// An instance of `HookTriggers` with `on_resume` trigger set.
     pub const ON_RESUME: Self = HookTriggers::new().on_resume();
 
+    /// An instance of `HookTriggers` with `on_yield` trigger set.
+    pub const ON_YIELD: Self = HookTriggers::new().on_yield();
+
     /// Returns a new instance of `HookTriggers` with all triggers disabled.
     pub const fn new() -> Self {
         HookTriggers {
@@ -410,6 +445,7 @@ impl HookTriggers {
             every_line: false,
             every_nth_instruction: None,
             on_resume: false,
+            on_yield: false,
         }
     }
 
@@ -453,6 +489,14 @@ impl HookTriggers {
         self
     }
 
+    /// Returns an instance of `HookTriggers` with [`on_yield`] trigger set.
+    ///
+    /// [`on_yield`]: #structfield.on_yield
+    pub const fn on_yield(mut self) -> Self {
+        self.on_yield = true;
+        self
+    }
+
     // Compute the mask to pass to `lua_sethook`.
     pub(crate) const fn mask(&self) -> c_int {
         let mut mask: c_int = 0;
@@ -490,6 +534,7 @@ impl std::ops::BitOr for HookTriggers {
         self.on_returns |= rhs.on_returns;
         self.every_line |= rhs.every_line;
         self.on_resume |= rhs.on_resume;
+        self.on_yield |= rhs.on_yield;
         if self.every_nth_instruction.is_none() && rhs.every_nth_instruction.is_some() {
             self.every_nth_instruction = rhs.every_nth_instruction;
         }

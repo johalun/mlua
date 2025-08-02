@@ -695,6 +695,11 @@ impl Lua {
             match result {
                 VmState::Continue => {}
                 VmState::Yield => {
+                    // Trigger yield hook for async functions
+                    let extra = (*ffi::lua_getextraspace(state)).cast::<ExtraData>();
+                    if !extra.is_null() {
+                        (*extra).raw_lua().trigger_yield_hook();
+                    }
                     ffi::lua_yield(state, 0);
                 }
             }
