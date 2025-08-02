@@ -158,10 +158,6 @@ impl Thread {
             let _sg = StackGuard::new(state);
             let _thread_sg = StackGuard::with_top(thread_state, 0);
 
-            // Trigger resume hooks before actually resuming
-            #[cfg(not(feature = "luau"))]
-            lua.trigger_resume_hook(thread_state)?;
-
             let nargs = args.push_into_stack_multi(&lua)?;
             if nargs > 0 {
                 check_stack(thread_state, nargs)?;
@@ -216,6 +212,11 @@ impl Thread {
     unsafe fn resume_inner(&self, lua: &RawLua, nargs: c_int) -> Result<(ThreadStatusInner, c_int)> {
         let state = lua.state();
         let thread_state = self.state();
+        
+        // Trigger resume hooks before actually resuming
+        #[cfg(not(feature = "luau"))]
+        lua.trigger_resume_hook(thread_state)?;
+        
         let mut nresults = 0;
         #[cfg(not(feature = "luau"))]
         let ret = ffi::lua_resume(thread_state, state, nargs, &mut nresults as *mut c_int);
