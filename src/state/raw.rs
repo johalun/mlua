@@ -38,7 +38,7 @@ use super::{Lua, LuaOptions, WeakLua};
 
 #[cfg(not(feature = "luau"))]
 use crate::{
-    debug::Debug,
+    debug::{Debug, HookTriggers},
     types::{HookCallback, HookKind, VmState},
 };
 
@@ -453,7 +453,15 @@ impl RawLua {
             ffi::luaL_checkstack(state, 3, ptr::null());
             if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == ffi::LUA_TTABLE {
                 ffi::lua_pushthread(state);
-                if ffi::lua_rawget(state, -2) == ffi::LUA_TUSERDATA {
+                let type_result = ffi::lua_rawget(state, -2);
+                if type_result == ffi::LUA_TTABLE {
+                    // New format: table with {triggers_table, callback}
+                    if ffi::lua_rawgeti(state, -1, 2) == ffi::LUA_TUSERDATA {
+                        hook_callback_ptr = get_internal_userdata::<HookCallback>(state, -1, ptr::null());
+                    }
+                    ffi::lua_pop(state, 1); // Pop the callback
+                } else if type_result == ffi::LUA_TUSERDATA {
+                    // Old format: just the callback (for backward compatibility)
                     hook_callback_ptr = get_internal_userdata::<HookCallback>(state, -1, ptr::null());
                 }
             }
@@ -500,13 +508,142 @@ impl RawLua {
 
             ffi::lua_pushthread(thread_state);
             ffi::lua_xmove(thread_state, state, 1); // key (thread)
-            let _ = push_internal_userdata(state, callback, false); // value (hook callback)
-            ffi::lua_rawset(state, -3); // hooktable[thread] = hook callback
+            
+            // Create a table to store both triggers and callback: {triggers_table, callback}
+            ffi::lua_createtable(state, 2, 0);
+            
+            // Store triggers as a table with all fields
+            ffi::lua_createtable(state, 0, 6);
+            ffi::lua_pushboolean(state, if triggers.on_calls { 1 } else { 0 });
+            ffi::lua_setfield(state, -2, cstr!("on_calls"));
+            ffi::lua_pushboolean(state, if triggers.on_returns { 1 } else { 0 });
+            ffi::lua_setfield(state, -2, cstr!("on_returns"));
+            ffi::lua_pushboolean(state, if triggers.every_line { 1 } else { 0 });
+            ffi::lua_setfield(state, -2, cstr!("every_line"));
+            ffi::lua_pushboolean(state, if triggers.on_resume { 1 } else { 0 });
+            ffi::lua_setfield(state, -2, cstr!("on_resume"));
+            ffi::lua_pushboolean(state, if triggers.on_yield { 1 } else { 0 });
+            ffi::lua_setfield(state, -2, cstr!("on_yield"));
+            if let Some(n) = triggers.every_nth_instruction {
+                ffi::lua_pushinteger(state, n as ffi::lua_Integer);
+            } else {
+                ffi::lua_pushnil(state);
+            }
+            ffi::lua_setfield(state, -2, cstr!("every_nth_instruction"));
+            ffi::lua_rawseti(state, -2, 1); // Store triggers table as first element
+            
+            // Store callback as the second element
+            let _ = push_internal_userdata(state, callback, false);
+            ffi::lua_rawseti(state, -2, 2);
+            
+            // Store the table in the hooks registry
+            ffi::lua_rawset(state, -3); // hooktable[thread] = {triggers_table, hook_callback}
         })?;
 
         ffi::lua_sethook(thread_state, Some(hook_proc), triggers.mask(), triggers.count());
 
         Ok(())
+    }
+
+    /// Retrieves thread-specific hook information (triggers and callback)
+    /// This version is safe to call during hook execution by avoiding StackGuard and being more careful with stack management
+    #[cfg(not(feature = "luau"))]
+    unsafe fn get_thread_hook_info(&self, thread_state: *mut ffi::lua_State) -> Option<(HookTriggers, HookCallback)> {
+        const HOOKS_KEY: *const c_char = cstr!("__mlua_hooks");
+        
+        let state = self.state();
+        let top = ffi::lua_gettop(state);
+        
+        // Get the hooks table from registry
+        if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) != ffi::LUA_TTABLE {
+            ffi::lua_settop(state, top);
+            return None;
+        }
+        
+        // Get the hook info for this thread
+        ffi::lua_pushthread(thread_state);
+        ffi::lua_xmove(thread_state, state, 1);
+        if ffi::lua_rawget(state, -2) != ffi::LUA_TTABLE {
+            ffi::lua_settop(state, top);
+            return None;
+        }
+        
+        // Extract triggers table (first element)
+        if ffi::lua_rawgeti(state, -1, 1) != ffi::LUA_TTABLE {
+            ffi::lua_settop(state, top);
+            return None;
+        }
+        
+        // Parse the triggers table
+        let on_calls = {
+            ffi::lua_getfield(state, -1, cstr!("on_calls"));
+            let result = ffi::lua_toboolean(state, -1) != 0;
+            ffi::lua_pop(state, 1);
+            result
+        };
+        let on_returns = {
+            ffi::lua_getfield(state, -1, cstr!("on_returns"));
+            let result = ffi::lua_toboolean(state, -1) != 0;
+            ffi::lua_pop(state, 1);
+            result
+        };
+        let every_line = {
+            ffi::lua_getfield(state, -1, cstr!("every_line"));
+            let result = ffi::lua_toboolean(state, -1) != 0;
+            ffi::lua_pop(state, 1);
+            result
+        };
+        let on_resume = {
+            ffi::lua_getfield(state, -1, cstr!("on_resume"));
+            let result = ffi::lua_toboolean(state, -1) != 0;
+            ffi::lua_pop(state, 1);
+            result
+        };
+        let on_yield = {
+            ffi::lua_getfield(state, -1, cstr!("on_yield"));
+            let result = ffi::lua_toboolean(state, -1) != 0;
+            ffi::lua_pop(state, 1);
+            result
+        };
+        let every_nth_instruction = {
+            ffi::lua_getfield(state, -1, cstr!("every_nth_instruction"));
+            let result = if ffi::lua_isnil(state, -1) != 0 {
+                None
+            } else {
+                Some(ffi::lua_tointeger(state, -1) as u32)
+            };
+            ffi::lua_pop(state, 1);
+            result
+        };
+        
+        ffi::lua_pop(state, 1); // Pop triggers table
+        
+        // Extract callback (second element)
+        if ffi::lua_rawgeti(state, -1, 2) != ffi::LUA_TUSERDATA {
+            ffi::lua_settop(state, top);
+            return None;
+        }
+        
+        let callback = match get_internal_userdata::<HookCallback>(state, -1, ptr::null()) {
+            ptr if !ptr.is_null() => unsafe { (*ptr).clone() },
+            _ => {
+                ffi::lua_settop(state, top);
+                return None;
+            }
+        };
+        
+        ffi::lua_settop(state, top); // Restore original stack
+        
+        let triggers = HookTriggers {
+            on_calls,
+            on_returns,
+            every_line,
+            every_nth_instruction,
+            on_resume,
+            on_yield,
+        };
+        
+        Some((triggers, callback))
     }
 
     /// Triggers resume hooks for a thread (if any)
@@ -517,17 +654,11 @@ impl RawLua {
         use crate::state::util::callback_error_ext;
         use std::ptr;
 
-        let state = self.state();
-        let _sg = StackGuard::new(state);
-
-        // For thread-specific hooks, we need to check if the hook has on_resume enabled
-        // The current implementation doesn't store triggers separately for thread hooks,
-        // so for now we'll implement this for global hooks only, but we'll trigger
-        // thread hooks that exist (assuming they want resume events if they're set)
-        
-        // Check for global hook first
-        if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
-            let triggers = (*self.extra.get()).hook_triggers;
+        // Check for thread-specific hook only if the thread doesn't have native hooks active
+        // This prevents interference between custom hook registry access and native hook execution
+        let thread_specific_hook_fired = if !ffi::lua_gethook(thread_state).is_none() {
+            false // Native hooks active, skip thread-specific hooks
+        } else if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
             if triggers.on_resume {
                 let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
                     let rawlua = (*extra).raw_lua();
@@ -539,6 +670,32 @@ impl RawLua {
                     VmState::Continue => {}
                     VmState::Yield => {
                         // Resume hooks cannot yield - for now we ignore this
+                    }
+                }
+                true // Thread-specific hook fired
+            } else {
+                false // Thread-specific hook exists but resume not enabled
+            }
+        } else {
+            false // No thread-specific hooks
+        };
+
+        // Check for global hook only if no thread-specific hook fired
+        if !thread_specific_hook_fired {
+            if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
+                let triggers = (*self.extra.get()).hook_triggers;
+                if triggers.on_resume {
+                    let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
+                        let rawlua = (*extra).raw_lua();
+                        let debug = Debug::new_resume(rawlua);
+                        hook_callback((*extra).lua(), &debug)
+                    });
+
+                    match status {
+                        VmState::Continue => {}
+                        VmState::Yield => {
+                            // Resume hooks cannot yield - for now we ignore this
+                        }
                     }
                 }
             }
@@ -555,12 +712,11 @@ impl RawLua {
         use crate::state::util::callback_error_ext;
         use std::ptr;
 
-        let state = self.state();
-        let _sg = StackGuard::new(state);
-
-        // Check for global hook first
-        if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
-            let triggers = (*self.extra.get()).hook_triggers;
+        // Check for thread-specific hook only if the thread doesn't have native hooks active
+        // This prevents interference between custom hook registry access and native hook execution
+        let thread_specific_hook_fired = if !ffi::lua_gethook(thread_state).is_none() {
+            false // Native hooks active, skip thread-specific hooks
+        } else if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
             if triggers.on_yield {
                 let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
                     let rawlua = (*extra).raw_lua();
@@ -571,7 +727,33 @@ impl RawLua {
                 match status {
                     VmState::Continue => {}
                     VmState::Yield => {
-                        // Yield hooks cannot yield - for now we ignore this
+                        // Yield hooks can yield, but since we're already yielding, we just continue
+                    }
+                }
+                true // Thread-specific hook fired
+            } else {
+                false // Thread-specific hook exists but yield not enabled
+            }
+        } else {
+            false // No thread-specific hooks
+        };
+
+        // Check for global hook only if no thread-specific hook fired
+        if !thread_specific_hook_fired {
+            if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
+                let triggers = (*self.extra.get()).hook_triggers;
+                if triggers.on_yield {
+                    let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
+                        let rawlua = (*extra).raw_lua();
+                        let debug = Debug::new_yield(rawlua);
+                        hook_callback((*extra).lua(), &debug)
+                    });
+
+                    match status {
+                        VmState::Continue => {}
+                        VmState::Yield => {
+                            // Yield hooks can yield, but since we're already yielding, we just continue
+                        }
                     }
                 }
             }
