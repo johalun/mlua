@@ -1,4 +1,4 @@
-use mlua::{prelude::*, Debug};
+use mlua::prelude::*;
 use mlua::{HookTriggers, VmState, DebugEvent};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
