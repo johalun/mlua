@@ -1,4 +1,4 @@
-use mlua::prelude::*;
+use mlua::{prelude::*, Debug};
 use mlua::{HookTriggers, VmState, DebugEvent};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -21,6 +21,7 @@ fn test_global_hooks_with_native_hooks() -> mlua::Result<()> {
         HookTriggers {
             on_resume: true,
             on_yield: true,
+            every_line: true,
             ..Default::default()
         },
         move |_lua, debug| {
@@ -28,6 +29,10 @@ fn test_global_hooks_with_native_hooks() -> mlua::Result<()> {
                 DebugEvent::Resume => {
                     println!("🌍 Global resume hook");
                     global_resume.fetch_add(1, Ordering::Relaxed);
+                }
+                DebugEvent::Line => {
+                    println!("📍 Native line hook: {:?}", debug.current_line());
+                    native_line.fetch_add(1, Ordering::Relaxed);
                 }
                 DebugEvent::Yield => {
                     println!("🌍 Global yield hook");
@@ -48,21 +53,6 @@ fn test_global_hooks_with_native_hooks() -> mlua::Result<()> {
             local z = 3  -- line 4
             return z + x + y  -- line 5
         "#).into_function()?,
-    )?;
-    
-    // Set native hooks on the thread (every line)
-    thread.set_hook(
-        HookTriggers {
-            every_line: true,
-            ..Default::default()
-        },
-        move |_lua, debug| {
-            if debug.event() == DebugEvent::Line {
-                println!("📍 Native line hook: {:?}", debug.current_line());
-                native_line.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(VmState::Continue)
-        },
     )?;
     
     println!("=== Testing global hooks + native hooks coexistence ===");
