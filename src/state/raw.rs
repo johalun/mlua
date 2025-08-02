@@ -654,11 +654,10 @@ impl RawLua {
         use crate::state::util::callback_error_ext;
         use std::ptr;
 
-        // Check for thread-specific hook only if the thread doesn't have native hooks active
-        // This prevents interference between custom hook registry access and native hook execution
-        let thread_specific_hook_fired = if !ffi::lua_gethook(thread_state).is_none() {
-            false // Native hooks active, skip thread-specific hooks
-        } else if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
+        // Check for thread-specific hook regardless of native hooks
+        // Resume/yield hooks are triggered outside of native hook execution context
+        // and should be safe to coexist with native hooks
+        let thread_specific_hook_fired = if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
             if triggers.on_resume {
                 let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
                     let rawlua = (*extra).raw_lua();
@@ -712,11 +711,10 @@ impl RawLua {
         use crate::state::util::callback_error_ext;
         use std::ptr;
 
-        // Check for thread-specific hook only if the thread doesn't have native hooks active
-        // This prevents interference between custom hook registry access and native hook execution
-        let thread_specific_hook_fired = if !ffi::lua_gethook(thread_state).is_none() {
-            false // Native hooks active, skip thread-specific hooks
-        } else if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
+        // Check for thread-specific hook regardless of native hooks
+        // Resume/yield hooks are triggered outside of native hook execution context
+        // and should be safe to coexist with native hooks
+        let thread_specific_hook_fired = if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
             if triggers.on_yield {
                 let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
                     let rawlua = (*extra).raw_lua();
