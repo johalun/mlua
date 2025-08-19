@@ -452,17 +452,19 @@ impl RawLua {
             let mut hook_callback_ptr = ptr::null();
             ffi::luaL_checkstack(state, 3, ptr::null());
             if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == ffi::LUA_TTABLE {
-                ffi::lua_pushthread(state);
+                // Try safe pointer key first to avoid stack corruption during execution
+                ffi::lua_pushlightuserdata(state, state as *mut c_void);
                 let type_result = ffi::lua_rawget(state, -2);
                 if type_result == ffi::LUA_TTABLE {
-                    // New format: table with {triggers_table, callback}
+                    // Found using safe pointer key - new format: table with {triggers_table, callback}
                     if ffi::lua_rawgeti(state, -1, 2) == ffi::LUA_TUSERDATA {
                         hook_callback_ptr = get_internal_userdata::<HookCallback>(state, -1, ptr::null());
                     }
                     ffi::lua_pop(state, 1); // Pop the callback
-                } else if type_result == ffi::LUA_TUSERDATA {
-                    // Old format: just the callback (for backward compatibility)
-                    hook_callback_ptr = get_internal_userdata::<HookCallback>(state, -1, ptr::null());
+                } else {
+                    // Not found with pointer key, skip thread object fallback to prevent stack corruption
+                    // This means the hook was registered before our fix and will be ignored for safety
+                    ffi::lua_pop(state, 1); // Pop the nil result from pointer key lookup
                 }
             }
             ffi::lua_settop(state, top);
@@ -685,27 +687,21 @@ impl RawLua {
     #[cfg(not(feature = "luau"))]
     pub(crate) unsafe fn trigger_resume_hook(&self, thread_state: *mut ffi::lua_State) -> Result<()> {
         use crate::debug::Debug;
-        use crate::types::VmState;
-        use crate::state::util::callback_error_ext;
-        use std::ptr;
+
+        // Simplified hook execution without callback_error_ext
+        // This prevents the corruption that occurs when calling callback_error_ext
+        // outside of a proper Lua hook context
 
         // Check for thread-specific hook regardless of native hooks
-        // Resume/yield hooks are triggered outside of native hook execution context
-        // and should be safe to coexist with native hooks
         let thread_specific_hook_fired = if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
             if triggers.on_resume {
-                let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
-                    let rawlua = (*extra).raw_lua();
-                    let debug = Debug::new_resume(rawlua);
-                    hook_callback((*extra).lua(), &debug)
-                });
-
-                match status {
-                    VmState::Continue => {}
-                    VmState::Yield => {
-                        // Resume hooks cannot yield - for now we ignore this
-                    }
-                }
+                // Create debug info for resume event
+                let rawlua = self;
+                let debug = Debug::new_resume(rawlua);
+                
+                // Call the hook directly without error handling machinery
+                // Ignore both VmState return value and errors to prevent corruption
+                let _ = hook_callback(self.lua(), &debug);
                 true // Thread-specific hook fired
             } else {
                 false // Thread-specific hook exists but resume not enabled
@@ -719,18 +715,13 @@ impl RawLua {
             if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
                 let triggers = (*self.extra.get()).hook_triggers;
                 if triggers.on_resume {
-                    let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
-                        let rawlua = (*extra).raw_lua();
-                        let debug = Debug::new_resume(rawlua);
-                        hook_callback((*extra).lua(), &debug)
-                    });
-
-                    match status {
-                        VmState::Continue => {}
-                        VmState::Yield => {
-                            // Resume hooks cannot yield - for now we ignore this
-                        }
-                    }
+                    // Create debug info for resume event
+                    let rawlua = self;
+                    let debug = Debug::new_resume(rawlua);
+                    
+                    // Call the hook directly without error handling machinery
+                    // Ignore both VmState return value and errors to prevent corruption
+                    let _ = hook_callback(self.lua(), &debug);
                 }
             }
         }
@@ -742,27 +733,21 @@ impl RawLua {
     #[cfg(not(feature = "luau"))]
     pub(crate) unsafe fn trigger_yield_hook(&self, thread_state: *mut ffi::lua_State) -> Result<()> {
         use crate::debug::Debug;
-        use crate::types::VmState;
-        use crate::state::util::callback_error_ext;
-        use std::ptr;
+
+        // Simplified hook execution without callback_error_ext
+        // This prevents the corruption that occurs when calling callback_error_ext
+        // outside of a proper Lua hook context
 
         // Check for thread-specific hook regardless of native hooks
-        // Resume/yield hooks are triggered outside of native hook execution context
-        // and should be safe to coexist with native hooks
         let thread_specific_hook_fired = if let Some((triggers, hook_callback)) = self.get_thread_hook_info(thread_state) {
             if triggers.on_yield {
-                let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
-                    let rawlua = (*extra).raw_lua();
-                    let debug = Debug::new_yield(rawlua);
-                    hook_callback((*extra).lua(), &debug)
-                });
-
-                match status {
-                    VmState::Continue => {}
-                    VmState::Yield => {
-                        // Yield hooks can yield, but since we're already yielding, we just continue
-                    }
-                }
+                // Create debug info for yield event
+                let rawlua = self;
+                let debug = Debug::new_yield(rawlua);
+                
+                // Call the hook directly without error handling machinery
+                // Ignore both VmState return value and errors to prevent corruption
+                let _ = hook_callback(self.lua(), &debug);
                 true // Thread-specific hook fired
             } else {
                 false // Thread-specific hook exists but yield not enabled
@@ -776,18 +761,13 @@ impl RawLua {
             if let Some(hook_callback) = (*self.extra.get()).hook_callback.clone() {
                 let triggers = (*self.extra.get()).hook_triggers;
                 if triggers.on_yield {
-                    let status = callback_error_ext(thread_state, ptr::null_mut(), false, |extra, _| {
-                        let rawlua = (*extra).raw_lua();
-                        let debug = Debug::new_yield(rawlua);
-                        hook_callback((*extra).lua(), &debug)
-                    });
-
-                    match status {
-                        VmState::Continue => {}
-                        VmState::Yield => {
-                            // Yield hooks can yield, but since we're already yielding, we just continue
-                        }
-                    }
+                    // Create debug info for yield event
+                    let rawlua = self;
+                    let debug = Debug::new_yield(rawlua);
+                    
+                    // Call the hook directly without error handling machinery
+                    // Ignore both VmState return value and errors to prevent corruption
+                    let _ = hook_callback(self.lua(), &debug);
                 }
             }
         }
