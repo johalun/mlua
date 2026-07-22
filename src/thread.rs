@@ -813,6 +813,46 @@ impl<R> Drop for AsyncThread<R> {
     }
 }
 
+/// Returns `true` if `thread_state` is suspended by a *debug hook* yield rather than by an
+/// ordinary yield.
+///
+/// The two park the coroutine in structurally different places, and that difference decides
+/// whether its stack may be truncated:
+///
+/// * An ordinary yield (`coroutine.yield`, or mlua's async poll protocol) is a *call*. The
+///   innermost frame is `coroutine.yield`'s C frame, which sits above every Lua frame's
+///   registers, so resetting the thread's stack to 0 cannot discard live data.
+/// * A hook yield (a count/line hook returning [`VmState::Yield`](crate::VmState::Yield)) is an
+///   *interruption*. There is no yield call: the innermost frame is the interrupted Lua function
+///   itself, and its live registers sit above where `lua_settop(L, 0)` would leave `top`. Lua
+///   marks a coroutine's stack only up to `top` and nils every slot above it during the atomic
+///   GC phase, so truncating here hands the script back a frame full of `nil` locals.
+///
+/// Checking whether the level-0 frame is a Lua function distinguishes the two.
+#[cfg(all(feature = "async", not(feature = "luau")))]
+unsafe fn is_hook_yielded(thread_state: *mut ffi::lua_State) -> bool {
+    unsafe {
+        if ffi::lua_status(thread_state) != ffi::LUA_YIELD {
+            return false;
+        }
+        let mut ar: ffi::lua_Debug = std::mem::zeroed();
+        if ffi::lua_getstack(thread_state, 0, &mut ar) == 0 {
+            return false;
+        }
+        if ffi::lua_getinfo(thread_state, cstr!("S"), &mut ar) == 0 || ar.what.is_null() {
+            return false;
+        }
+        // `what` is "Lua" or "main" for a Lua frame, "C" for a C frame.
+        *ar.what != b'C' as std::os::raw::c_char
+    }
+}
+
+/// Luau has no debug hooks that can yield, so a suspended thread is always an ordinary yield.
+#[cfg(all(feature = "async", feature = "luau"))]
+unsafe fn is_hook_yielded(_thread_state: *mut ffi::lua_State) -> bool {
+    false
+}
+
 #[cfg(feature = "async")]
 impl<R: FromLuaMulti> Stream for AsyncThread<R> {
     type Item = Result<R>;
@@ -829,7 +869,11 @@ impl<R: FromLuaMulti> Stream for AsyncThread<R> {
         let thread_state = self.thread.state();
         unsafe {
             let _sg = StackGuard::new(state);
-            let _thread_sg = StackGuard::with_top(thread_state, 0);
+            if is_hook_yielded(thread_state) {
+                // Resuming an interrupted frame: what sits on the thread stack is that
+                // frame's live registers, not resume arguments.
+                nargs = 0;
+            }
             let _wg = WakerGuard::new(&lua, cx.waker());
 
             // If the resume callback runs, it may touch this thread, so re-read the argument count
@@ -845,19 +889,31 @@ impl<R: FromLuaMulti> Stream for AsyncThread<R> {
 
             let (status, nresults) = (self.thread).resume_inner(&lua, nargs)?;
 
-            if status.is_yielded() && nresults == 1 && is_poll_pending(thread_state) {
-                // Exec thread yield callback
-                let on_yield = lua.thread_event_triggers().on_yield;
-                exec_thread_event(&lua, on_yield, thread_state, || {
-                    ThreadEvent::Yield(self.thread.clone())
-                })?;
-                return Poll::Pending;
+            if status.is_yielded() {
+                let hook_yield = is_hook_yielded(thread_state);
+                if hook_yield || (nresults == 1 && is_poll_pending(thread_state)) {
+                    // Exec thread yield callback
+                    let on_yield = lua.thread_event_triggers().on_yield;
+                    exec_thread_event(&lua, on_yield, thread_state, || {
+                        ThreadEvent::Yield(self.thread.clone())
+                    })?;
+                    if hook_yield {
+                        // Leave the suspended frame's stack untouched; the
+                        // "yielded values" are its live registers.
+                        cx.waker().wake_by_ref();
+                    } else {
+                        // Protocol yield: the pending marker is scratch.
+                        ffi::lua_settop(thread_state, 0);
+                    }
+                    return Poll::Pending;
+                }
             }
 
             check_stack(state, nresults + 1)?;
             ffi::lua_xmove(thread_state, state, nresults);
 
             if status.is_yielded() {
+                ffi::lua_settop(thread_state, 0);
                 let on_yield = lua.thread_event_triggers().on_yield;
                 exec_thread_event(&lua, on_yield, thread_state, || {
                     ThreadEvent::Yield(self.thread.clone())
@@ -884,7 +940,11 @@ impl<R: FromLuaMulti> Future for AsyncThread<R> {
         let thread_state = self.thread.state();
         unsafe {
             let _sg = StackGuard::new(state);
-            let _thread_sg = StackGuard::with_top(thread_state, 0);
+            if is_hook_yielded(thread_state) {
+                // Resuming an interrupted frame: what sits on the thread stack is that
+                // frame's live registers, not resume arguments.
+                nargs = 0;
+            }
             let _wg = WakerGuard::new(&lua, cx.waker());
 
             // If the resume callback runs, it may touch this thread, so re-read the argument count
@@ -898,7 +958,8 @@ impl<R: FromLuaMulti> Future for AsyncThread<R> {
             let (status, nresults) = self.thread.resume_inner(&lua, nargs)?;
 
             if status.is_yielded() {
-                let pending = nresults == 1 && is_poll_pending(thread_state);
+                let hook_yield = is_hook_yielded(thread_state);
+                let pending = !hook_yield && nresults == 1 && is_poll_pending(thread_state);
 
                 // Exec thread yield callback
                 let on_yield = lua.thread_event_triggers().on_yield;
@@ -906,6 +967,10 @@ impl<R: FromLuaMulti> Future for AsyncThread<R> {
                     ThreadEvent::Yield(self.thread.clone())
                 })?;
 
+                if !hook_yield {
+                    // Protocol/user yield: the yielded values are scratch.
+                    ffi::lua_settop(thread_state, 0);
+                }
                 if !pending {
                     // Ignore values returned via yield()
                     cx.waker().wake_by_ref();
